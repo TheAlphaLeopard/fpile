@@ -165,31 +165,34 @@ var _xhtmlNS='http://www.w3.org/1999/xhtml';
 var _origCENS=document.createElementNS.bind(document);
 document.createElement=function(tag){return _origCENS(_xhtmlNS,tag);};
 
-(function(){
+(async function ensureCoi(){
 var _s=document.createElement('div');
 _s.style.cssText='position:fixed;top:0;left:0;right:0;background:#1a1a2e;color:#0f0;font-family:monospace;font-size:13px;padding:10px 16px;z-index:99999;white-space:pre-wrap;max-height:40vh;overflow-y:auto';
 document.documentElement.appendChild(_s);
 function _l(m){var d=document.createElement('div');d.textContent='[COI] '+m;_s.appendChild(d);console.log('[COI] '+m);}
-_l('SVG bootstrap loaded. crossOriginIsolated='+self.crossOriginIsolated);
-_l('baseURI='+document.baseURI);
-if(self.crossOriginIsolated){_l('Already isolated. Removing overlay in 2s.');setTimeout(function(){_s.remove();},2000);return;}
-if(!('serviceWorker' in navigator)){_l('ERROR: No SW support.');_s.style.color='#f44';return;}
-var swUrl=new URL('./coi-serviceworker.js',document.baseURI).href;
-_l('SW URL: '+swUrl);
-navigator.serviceWorker.register(swUrl,{scope:'./'}).then(function(r){
-_l('SW registered! Scope: '+r.scope);
-_l('Waiting for activation...');
-navigator.serviceWorker.ready.then(function(){
-_l('SW active. Reloading...');
-try{sessionStorage.setItem('coi-tried','1');}catch(e){}
-setTimeout(function(){location.reload();},500);
-});
-}).catch(function(e){
-_l('SW registration FAILED: '+e.message);
-_l('Will retry in 3s...');
-_s.style.background='#2e1a1a';_s.style.color='#f44';
-setTimeout(function(){location.reload();},3000);
-});
+try {
+    _l('SVG bootstrap loaded. crossOriginIsolated='+self.crossOriginIsolated);
+    if(!('serviceWorker' in navigator)){_l('ERROR: No SW support.');_s.style.color='#f44';return;}
+    if(location.protocol!=='http:'&&location.protocol!=='https:'){_l('Serve this file over http(s) — jam cores disabled on '+location.protocol+'.');_s.style.color='#f44';return;}
+    if(self.crossOriginIsolated){_l('Already isolated. Removing overlay in 2s.');setTimeout(function(){_s.remove();},2000);return;}
+
+    // same clamp as fpile.html: at most two registration attempts per session
+    var KEY='fpile-coi-reloads'; var n=0;
+    try{n=Number(sessionStorage.getItem(KEY)||'0');}catch(e){}
+    if(n>=2){_l('Cross-origin isolation unavailable after '+n+' attempts — jam cores disabled.');_s.style.color='#f44';return;}
+    try{sessionStorage.setItem(KEY,String(n+1));}catch(e){}
+
+    var swUrl=new URL('./coi-serviceworker.js',document.baseURI).href;
+    var reg=await navigator.serviceWorker.register(swUrl,{scope:'./'});
+    _l('SW registered! Scope: '+reg.scope);
+    if(!reg.active) await navigator.serviceWorker.ready;
+    _l('SW active. Reloading...');
+    setTimeout(function(){location.reload();},500);
+} catch(e) {
+    _l('COI bootstrap failed: '+e.message);
+    _s.style.background='#2e1a1a';_s.style.color='#f44';
+    console.warn('[fpile] COI bootstrap failed:', e);
+}
 })();]]></script><input type="file" id="up" webkitdirectory="" directory="" multiple="multiple" hidden=""/>
 <input type="file" id="pack-up" webkitdirectory="" directory="" multiple="multiple" hidden=""/>
 <div id="status"/>
@@ -340,12 +343,15 @@ class VFS {
 }
 
 /* ── JAM Load / Pack ───────────────────────────────────────── */
-async function loadJam(file) {
-    const buf = await file.arrayBuffer();
+function jamFiles(buf) {
     const view = new DataView(buf);
     if (view.getUint32(0, false) !== 0x4A414D00) throw new Error('Invalid .JAM file');
     const payload = new Uint8Array(buf, 8, view.getUint32(4, true));
     return new Map(Object.entries(fflate.unzipSync(B122.decode(payload))));
+}
+
+async function loadJam(file) {
+    return jamFiles(await file.arrayBuffer());
 }
 
 async function packJam(fileList) {
@@ -366,6 +372,230 @@ async function packJam(fileList) {
     link.download = (first ? first.path.split('/')[0] : 'app') + '.jam';
     link.click();
     setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+}
+
+/* ── Jam Cores (core-<name>.jam) ───────────────────────────── */
+/* A file named core-<name>.jam (uploaded with the ROMs, or in ./cores/)
+   becomes a custom core: any ROM whose extension claims that core boots the
+   jam instead of the built-in EmulatorJS path. The jam is unpacked and
+   virtually hosted by coi-serviceworker.js at
+   ./__jamcore__/<coreId>/<file> (Cache API-backed), so the core runs as a
+   real document that can read location.search: it is booted with
+   ?rom=__rom__/<file> — a URL the SW answers with the ROM streamed from
+   private OPFS storage. Works with cores that resolve relative ROM URLs
+   against their own document (no core modifications needed).                */
+const CORE_JAM_RE = /^core-([a-z0-9][a-z0-9_-]*)\.jam$/i;
+/* core-<name>.jam ↔ ROM extension name. Aliases map additional ROM formats to
+   a core: core-3ds.jam (Azahar) also handles CCI/CXI dumps, core-psp.jam
+   (PPSSPP) also handles ISO/CSO/CHD/PBP/PRX.                              */
+const CORE_EXT_ALIASES = {
+    '3ds': ['3ds', 'cci', 'zcci', 'cxi', 'zcxi', 'app', 'cfa', '3dsx', 'z3dsx'],
+    'psp': ['psp', 'cso', 'pbp', 'prx', 'iso', 'chd'],
+};
+const customCores = new Map();   // name -> { name, file|Blob, coreId|null, uploaded:true }
+const hostedCoreExts = new Set();// core names confirmed to exist at ./cores/core-<name>.jam
+const coreAlias = new Map();     // ROM ext -> responsible core name
+
+function rebuildCoreAlias() {
+    coreAlias.clear();
+    const claim = (ext, name) => { if (!coreAlias.has(ext)) coreAlias.set(ext, name); };
+    for (const n of customCores.keys()) claim(n, n);
+    for (const n of hostedCoreExts) claim(n, n);
+    for (const [n, aliases] of Object.entries(CORE_EXT_ALIASES)) {
+        if (customCores.has(n) || hostedCoreExts.has(n))
+            for (const a of aliases) claim(a, n);
+    }
+}
+
+const coreId = (ext, size, sha8) => ext + '-' + size + '-' + sha8;
+
+async function sha8Hex(buf) {
+    try { // may be absent on plain http (non-localhost) — fall back to a stable dash-less tag
+        const d = await crypto.subtle.digest('SHA-256', buf);
+        return Array.from(new Uint8Array(d).subarray(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) { return 'x1' + buf.byteLength.toString(36); }
+}
+
+function coreUrl(coreId_, rel) {
+    return new URL('./__jamcore__/' + coreId_ + '/' + rel, location.href).href;
+}
+
+async function probeHostedCore(ext) {
+    if (customCores.has(ext) || hostedCoreExts.has(ext)) return true;
+    if (location.protocol !== 'http:' && location.protocol !== 'https:') return false;
+    try {
+        const res = await fetch('./cores/core-' + ext + '.jam', { method: 'HEAD' });
+        if (res.ok) { hostedCoreExts.add(ext); rebuildCoreAlias(); }
+    } catch (e) {}
+    return hostedCoreExts.has(ext);
+}
+
+/* For a file type no core claims yet, try the servers fallback: the extension
+   itself plus any core whose alias table lists it (e.g. .cci → core-3ds).    */
+async function probeDroppedExt(ext) {
+    const cands = new Set([ext]);
+    for (const [n, aliases] of Object.entries(CORE_EXT_ALIASES))
+        if (aliases.includes(ext)) cands.add(n);
+    for (const c of cands)
+        if (await probeHostedCore(c)) return true;
+    return false;
+}
+
+/* Unpack a core jam (uploaded File or downloaded Blob) and install it into
+   the virtual host. Returns the coreId. Idempotent per coreId.              */
+async function installCoreJam(ext) {
+    let rec = customCores.get(ext) || null;
+    if (!rec) {
+        await probeHostedCore(ext);
+        if (!hostedCoreExts.has(ext)) throw new Error('core-' + ext + '.jam not found — include it in the uploaded folder or place it beside this page (cores/)');
+        const res = await fetch('./cores/core-' + ext + '.jam');
+        if (!res.ok) throw new Error('Failed to download core-' + ext + '.jam (HTTP ' + res.status + ')');
+        rec = { name: 'core-' + ext, file: await res.blob(), uploaded: false };
+        customCores.set(ext, rec);
+    }
+    if (rec.coreId) return rec.coreId;
+
+    setStatus('Unpacking core-' + ext + '.jam…');
+    const buf = await rec.file.arrayBuffer();
+    const size = buf.byteLength;
+    const id = coreId(ext, size, await sha8Hex(buf));
+    rec.coreId = id;
+
+    const cache = await caches.open('jamcore-' + id);
+    if (await cache.match(coreUrl(id, 'index.html'))) return id;
+
+    // pick the entry the same way VFS does (shallowest index.html preferred)
+    const files = jamFiles(buf);
+    const htmls = [...files.keys()].filter(p => /\.html?$/i.test(p));
+    if (!htmls.length) throw new Error('No HTML entry inside core-' + ext + '.jam');
+    htmls.sort((a, b) => {
+        const aD = a.split('/').length, bD = b.split('/').length;
+        return aD !== bD ? aD - bD : a.length - b.length;
+    });
+    const entry = htmls.find(p => /(^|\/)index\.html?$/i.test(p)) || htmls[0];
+    const base = entry.includes('/') ? entry.slice(0, entry.lastIndexOf('/') + 1) : '';
+
+    const puts = [];
+    for (const [path, data] of files) {
+        if (path.endsWith('/') || path.includes('__MACOSX') || path.endsWith('.DS_Store')) continue;
+        let rel = path.replace(/\\/g, '/').replace(/^\/+/, '');
+        if (base && rel.startsWith(base)) rel = rel.slice(base.length);
+        const headers = { 'Content-Type': mime(rel) };
+        puts.push(cache.put(new Request(coreUrl(id, rel)), new Response(data, { headers })));
+    }
+    if (entry !== 'index.html') {
+        puts.push(cache.put(new Request(coreUrl(id, 'index.html')),
+            new Response(files.get(entry), { headers: { 'Content-Type': 'text/html' } })));
+    }
+    await Promise.all(puts);
+    return id;
+}
+
+/* OPFS names must be filesystem-safe; keep them URL-round-trippable. */
+function sanitizeOpfsName(s) {
+    return s.replace(/[^\w.\-() ]+/g, '_').slice(0, 180) || 'rom';
+}
+
+/* Stream-clone a ROM into private OPFS storage (disk-backed, GBs allowed).
+   Cache API entries carry a per-entry size cap, so big ROMs are stored here
+   and the SW streams them out on demand via a pointer entry.               */
+async function putRomInOPFS(name, srcStream, expectedSize) {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle('fpile-roms', { create: true });
+    const fh = await dir.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await srcStream.pipeTo(w);
+    const stored = await (await dir.getFileHandle(name)).getFile();
+    if (expectedSize != null && stored.size !== expectedSize)
+        throw new Error('ROM storage mismatch (' + stored.size + ' bytes, expected ' + expectedSize + ')');
+    return stored.size;
+}
+
+/* Launch a ROM through its custom core jam. */
+async function launchCoreJamRom(item) {
+    playerLayer.style.display = 'block';
+    playerContent.innerHTML = '';
+    try {
+        if (!('caches' in self)) throw new Error('Cache Storage unavailable — jam cores need http(s) + service worker support');
+        if (location.protocol !== 'http:' && location.protocol !== 'https:')
+            throw new Error('Serve fpile over http(s) (e.g. python -m http.server) to use jam cores');
+
+        if (!self.crossOriginIsolated)
+            console.warn('[fpile] not cross-origin isolated — the core will enable it itself or fail');
+
+        const ext = item.core;
+        setStatus('Booting core-' + ext + '.jam…');
+        const id = await installCoreJam(ext);
+
+        const cache = await caches.open('jamcore-' + id);
+        const romSrc = item.name + '.' + item.ext;
+        const romAbs = coreUrl(id, '__rom__/' + encodeURIComponent(romSrc));
+        // ROMs live in OPFS (Cache API entries carry a per-entry size cap), the
+        // cache entry is a small pointer the SW streams out at fetch time.
+        // A pointer with a stale/unknown size is treated as missing so a
+        // changed ROM file re-installs instead of failing inside the core.
+        let needsPut = true;
+        try {
+            const ptr = await cache.match(romAbs);
+            if (ptr) {
+                const meta = await ptr.json();
+                if (meta && meta.opfs && meta.size === item.file.size) {
+                    needsPut = false;
+                    // Trust the pointer but verify its backing: OPFS storage can
+                    // be wiped (site data cleanup) while Cache entries survive.
+                    try {
+                        const dirName = meta.opfs.slice(0, meta.opfs.lastIndexOf('/'));
+                        const fName = meta.opfs.slice(meta.opfs.lastIndexOf('/') + 1);
+                        const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(dirName);
+                        if ((await (await dir.getFileHandle(fName)).getFile()).size !== meta.size) needsPut = true;
+                    } catch (e) { needsPut = true; }
+                }
+            }
+        } catch (e) {}
+        if (needsPut) {
+            setStatus('Installing ' + romSrc + ' (' + (item.file.size / 1048576).toFixed(0) + ' MB)…');
+            const opfsName = sanitizeOpfsName(romSrc);
+            await putRomInOPFS(opfsName, item.file.stream(), item.file.size);
+            await cache.put(new Request(romAbs),
+                new Response(JSON.stringify({ opfs: 'fpile-roms/' + opfsName, size: item.file.size }),
+                    { headers: { 'Content-Type': 'application/json' } }));
+        }
+
+        // A relative ?rom= works for every core: relative URLs resolve against
+        // the core document's own URL, which the SW serves from the same jam
+        // cache (this also bypasses cores' own URL-rom caches, which Chrome
+        // aborts for multi-hundred-MB entries). The core gets a REAL http URL
+        // plus COI headers either way.
+        const romTail = '__rom__/' + encodeURIComponent(romSrc);
+        const bootUrl = coreUrl(id, 'index.html') +
+            '?rom=' + encodeURIComponent(romTail) +
+            '&name=' + encodeURIComponent(item.name);
+
+        const ifr = document.createElement('iframe');
+        ifr.style.cssText = 'width:100%;height:100%;border:none;';
+        ifr.setAttribute('allow', 'autoplay; fullscreen; gamepad *;');
+        ifr.src = bootUrl;
+        playerContent.replaceChildren(ifr);
+        setStatus('');
+    } catch (err) {
+        setStatus('Core error: ' + err.message);
+        console.error('[corejam]', err);
+    }
+}
+
+/* Drop jamcore caches that no longer match the uploaded/hosted cores. */
+async function sweepJamCores() {
+    try {
+        const keep = new Set([...customCores.keys(), ...hostedCoreExts]);
+        const names = await caches.keys();
+        await Promise.all(names.filter(n => {
+            if (!n.startsWith('jamcore-')) return false;
+            const seg = n.slice('jamcore-'.length).split('-'); // <ext…>-<size>-<sha8> (ext itself may hold dashes)
+            if (seg.length < 3) return true;                   // malformed
+            const ext = seg.slice(0, -2).join('-');
+            return !keep.has(ext);
+        }).map(n => caches.delete(n)));
+    } catch (e) {}
 }
 
 /* ── JAM Runtime (injected into iframe) ────────────────────── */
@@ -590,9 +820,10 @@ function setStatus(msg) {
 }
 
 /* ── Scanning ──────────────────────────────────────────────── */
-function processFiles(files) {
+async function processFiles(files) {
     imgMap.forEach(u => URL.revokeObjectURL(u)); imgMap.clear();
     blobCache.forEach(u => URL.revokeObjectURL(u)); blobCache.clear();
+    customCores.clear(); hostedCoreExts.clear();
 
     files.forEach(f => {
         const ln = f.name.toLowerCase();
@@ -602,23 +833,48 @@ function processFiles(files) {
         }
     });
 
-    items = files.filter(f => !f.name.startsWith('.') && f.size > 0).map(f => {
-        const ext = f.name.split('.').pop().toLowerCase();
-        const name = f.name.substring(0, f.name.lastIndexOf('.')) || f.name;
-        let type = 'emu', core = null;
-        if (ext === 'swf') { type = 'flash'; core = 'flash'; }
-        else if (ext === 'jam') { type = 'jam'; core = 'jam'; }
-        else if (BLACKLIST.includes(ext)) return null;
-        else {
-            for (const [c, exts] of Object.entries(CORE_MAP))
-                if (exts.includes(ext)) { core = c; break; }
-            if (!core) {
-                // Unknown extension — show as "Unknown" so the user can still see it
-                core = 'unknown';
-            }
+    // Core jams, anywhere in the uploaded folder: core-<name>.jam
+    for (const f of files) {
+        if (f.name && CORE_JAM_RE.test(f.name)) {
+            const ext = f.name.match(CORE_JAM_RE)[1].toLowerCase();
+            if (!customCores.has(ext)) customCores.set(ext, { name: 'core-' + ext, file: f, uploaded: true });
         }
-        return { name, file: f, path: f.webkitRelativePath || f.name, type, core, ext, thumb: imgMap.get(name.toLowerCase()) };
-    }).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+    }
+    rebuildCoreAlias();
+
+    const classify = () => {
+        const list = [], dropped = new Set();
+        for (const f of files.filter(f => !f.name.startsWith('.') && f.size > 0)) {
+            const ext = f.name.split('.').pop().toLowerCase();
+            const name = f.name.substring(0, f.name.lastIndexOf('.')) || f.name;
+            if (CORE_JAM_RE.test(f.name)) continue;
+            let type = 'emu', core = null;
+            const coreName = coreAlias.get(ext);
+            if (coreName) { type = 'coreRom'; core = coreName; }
+            else if (ext === 'swf') { type = 'flash'; core = 'flash'; }
+            else if (ext === 'jam') { type = 'jam'; core = 'jam'; }
+            else if (BLACKLIST.includes(ext)) continue;
+            else {
+                for (const [c, exts] of Object.entries(CORE_MAP))
+                    if (exts.includes(ext)) { core = c; break; }
+                if (!core) { dropped.add(ext); continue; }
+            }
+            list.push({ name, file: f, path: f.webkitRelativePath || f.name, type, core, ext, thumb: imgMap.get(name.toLowerCase()) });
+        }
+        return { list: list.sort((a, b) => a.name.localeCompare(b.name)), dropped };
+    };
+
+    let res = classify();
+    items = res.list;
+    if (res.dropped.size) {
+        sweepJamCores();
+        // unknown extensions might be handled by a core jam in ./cores/ — probe those
+        await Promise.all([...res.dropped].map(probeDroppedExt));
+        res = classify();
+        items = res.list;
+    } else {
+        sweepJamCores();
+    }
 
     groups.clear();
     items.forEach(i => {
@@ -626,11 +882,16 @@ function processFiles(files) {
         groups.get(i.core).push(i);
     });
 
+    const skipNote = res.dropped.size ? ' — skipped ' + res.dropped.size + ' file type(s): ' +
+        [...res.dropped].map(e => '.' + e).join(' ') + ' (no core)' : '';
     if (items.length) {
         grid.classList.remove('hidden');
         currentView = 'systems';
         render();
-        setStatus(items.length + ' files loaded');
+        setStatus(items.length + ' files loaded' + skipNote);
+    } else if (res.dropped.size) {
+        setStatus('Skipped ' + res.dropped.size + ' file type(s): ' + [...res.dropped].map(e => '.' + e).join(' ') +
+            ' — upload core-<ext>.jam with the folder (or keep it in ./cores/)');
     }
 }
 
@@ -639,7 +900,7 @@ function render() {
     if (currentView === 'systems') {
         grid.innerHTML = [...groups.keys()].sort().map(core => {
             const games = groups.get(core);
-            const label = LABELS[core] || core;
+            const label = LABELS[core] || core.toUpperCase();
             return `<div class="card" data-core="${core}">
                 <div class="sq">${games[0].thumb ? `<img src="${games[0].thumb}">` : `<span>${label}</span>`}</div>
                 <div class="title">${label} (${games.length})</div>
@@ -682,6 +943,7 @@ function launch(item) {
     playerLayer.style.display = 'block';
     playerContent.innerHTML = '';
 
+    if (item.type === 'coreRom') { launchCoreJamRom(item); return; }
     if (item.type === 'flash') {
         const url = URL.createObjectURL(item.file);
         frame(`<html><head><title>${item.name}</title><style>body,html{margin:0;padding:0;background:#000;overflow:hidden;width:100%;height:100%}</style></head><body>
@@ -769,7 +1031,7 @@ document.getElementById('btn-home').addEventListener('click', goHome);
 
 document.getElementById('up').addEventListener('change', e => {
     const files = Array.from(e.target.files);
-    if (files.length) processFiles(files);
+    if (files.length) processFiles(files).catch(err => { setStatus('Error: ' + err.message); console.error(err); });
     e.target.value = '';
 });
 
@@ -782,6 +1044,9 @@ document.getElementById('pack-up').addEventListener('change', async e => {
     }
     e.target.value = '';
 });
+
+// Test/debug handles (not used by the UI)
+window.__fpile = { processFiles, launch, goHome, installCoreJam, probeHostedCore, rebuildCoreAlias, putRomInOPFS, sanitizeOpfsName, customCores, hostedCoreExts, coreUrl, coreAlias, get items(){ return items; }, get groups(){ return groups; } };
 });]]></script>
 <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
 <script>//<![CDATA[
