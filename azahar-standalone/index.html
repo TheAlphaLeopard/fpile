@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Azahar</title>
+<style>
+  :root{
+    --bg:#0a0a0a;
+    --ivory:#fffff0;
+    --muted:#555;
+    --dim:#333;
+    --accent:#6ab0ff;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;border:none;outline:none}
+  html,body{width:100%;height:100%;background:var(--bg);overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+
+  #boot{position:fixed;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:0;padding:24px}
+  #boot.hidden{display:none}
+
+  h1{font-size:2.2rem;font-weight:300;letter-spacing:-.01em;color:var(--ivory)}
+  .sub{font-size:.58rem;font-weight:500;letter-spacing:.32em;
+    text-transform:uppercase;color:var(--muted);margin-top:8px}
+
+  #bar{width:200px;height:1px;background:var(--dim);margin-top:36px;overflow:hidden}
+  #bar > div{height:100%;width:0;background:var(--accent);transition:width .3s}
+
+  #status{font-size:.7rem;color:var(--muted);margin-top:14px;
+    letter-spacing:.04em;min-height:1em;text-align:center}
+
+  #emu{position:fixed;inset:0;display:none;background:#000}
+  #emu.on{display:block}
+  #canvas{width:100%;height:100%;display:block;object-fit:contain;
+    image-rendering:pixelated}
+</style>
+</head>
+<body>
+
+<div id="boot">
+  <h1>Azahar</h1>
+  <div class="sub">3DS</div>
+  <div id="bar"><div></div></div>
+  <div id="status"></div>
+</div>
+
+<div id="emu">
+  <canvas id="canvas" width="400" height="480"></canvas>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
