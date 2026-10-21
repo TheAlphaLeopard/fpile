@@ -374,134 +374,65 @@ async function packJam(fileList) {
     setTimeout(() => URL.revokeObjectURL(link.href), 10000);
 }
 
-/* ── Jam Cores (core-<name>.jam) ───────────────────────────── */
-/* A file named core-<name>.jam (uploaded with the ROMs, or in ./cores/)
-   becomes a custom core: any ROM whose extension claims that core boots the
-   jam instead of the built-in EmulatorJS path. The jam is unpacked and
-   virtually hosted by coi-serviceworker.js at
-   ./__jamcore__/<coreId>/<file> (Cache API-backed), so the core runs as a
-   real document that can read location.search: it is booted with
-   ?rom=__rom__/<file> — a URL the SW answers with the ROM streamed from
-   private OPFS storage. Works with cores that resolve relative ROM URLs
+/* ── System cores (driver scripts) ─────────────────────────── */
+/* Instead of a bundled archive, each system core is a plain driver script in
+   ./cores/: cores/<name>.js. The page evaluates it once; the driver registers
+   itself in window.fpileDrivers[name] and owns ALL its core know-how: the
+   ROM extensions it boots, which folder files it needs and how to install
+   them into the virtual host ./__jamcore__/<id>/<file> (Cache API-backed,
+   served with COI headers by coi-serviceworker.js). The core document is
+   booted with ?rom=__rom__/<file> — a URL the SW answers with the ROM streamed
+   from private OPFS storage. Works with cores that resolve relative URLs
    against their own document (no core modifications needed).                */
-const CORE_JAM_RE = /^core-([a-z0-9][a-z0-9_-]*)\.jam$/i;
-/* core-<name>.jam ↔ ROM extension name. Aliases map additional ROM formats to
-   a core: core-3ds.jam (Azahar) also handles CCI/CXI dumps, core-psp.jam
-   (PPSSPP) also handles ISO/CSO/CHD/PBP/PRX.                              */
-const CORE_EXT_ALIASES = {
-    '3ds': ['3ds', 'cci', 'zcci', 'cxi', 'zcxi', 'app', 'cfa', '3dsx', 'z3dsx'],
-    'psp': ['psp', 'cso', 'pbp', 'prx', 'iso', 'chd'],
-};
-const customCores = new Map();   // name -> { name, file|Blob, coreId|null, uploaded:true }
-const hostedCoreExts = new Set();// core names confirmed to exist at ./cores/core-<name>.jam
-const coreAlias = new Map();     // ROM ext -> responsible core name
-
-function rebuildCoreAlias() {
-    coreAlias.clear();
-    const claim = (ext, name) => { if (!coreAlias.has(ext)) coreAlias.set(ext, name); };
-    for (const n of customCores.keys()) claim(n, n);
-    for (const n of hostedCoreExts) claim(n, n);
-    for (const [n, aliases] of Object.entries(CORE_EXT_ALIASES)) {
-        if (customCores.has(n) || hostedCoreExts.has(n))
-            for (const a of aliases) claim(a, n);
-    }
-}
-
-const coreId = (ext, size, sha8) => ext + '-' + size + '-' + sha8;
-
-async function sha8Hex(buf) {
-    try { // may be absent on plain http (non-localhost) — fall back to a stable dash-less tag
-        const d = await crypto.subtle.digest('SHA-256', buf);
-        return Array.from(new Uint8Array(d).subarray(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');
-    } catch (e) { return 'x1' + buf.byteLength.toString(36); }
-}
+const DRIVER_FILES = ['3ds', 'psp'];
+const coreDrivers = new Map();      // name -> driver object (window.fpileDrivers[name])
 
 function coreUrl(coreId_, rel) {
     return new URL('./__jamcore__/' + coreId_ + '/' + rel, location.href).href;
 }
 
-async function probeHostedCore(ext) {
-    if (customCores.has(ext) || hostedCoreExts.has(ext)) return true;
-    if (location.protocol !== 'http:' && location.protocol !== 'https:') return false;
-    try {
-        const res = await fetch('./cores/core-' + ext + '.jam', { method: 'HEAD' });
-        if (res.ok) { hostedCoreExts.add(ext); rebuildCoreAlias(); }
-    } catch (e) {}
-    return hostedCoreExts.has(ext);
+/* Everything a driver needs from the page: the virtual-host URLs (Cache API
+   keys), an opener for its cache, a reset hook, and entry-point passthroughs. */
+function driverCtx(drv) {
+    const id = drv.name;
+    return {
+        id,
+        url: rel => coreUrl(id, rel),
+        openCache: () => caches.open('jamcore-' + id),
+        reset: () => caches.delete('jamcore-' + id),
+        setStatus: m => setStatus(m),
+        mime: rel => mime(rel),
+    };
 }
 
-/* For a file type no core claims yet, try the servers fallback: the extension
-   itself plus any core whose alias table lists it (e.g. .cci → core-3ds).    */
-async function probeDroppedExt(ext) {
-    const cands = new Set([ext]);
-    for (const [n, aliases] of Object.entries(CORE_EXT_ALIASES))
-        if (aliases.includes(ext)) cands.add(n);
-    for (const c of cands)
-        if (await probeHostedCore(c)) return true;
-    return false;
+/* Evaluate a driver file once (indirect eval = global scope) and return the
+   driver it registered. Throws when the file is missing or misbehaves.      */
+async function ensureDriver(name) {
+    if (coreDrivers.has(name)) return coreDrivers.get(name);
+    if (location.protocol !== 'http:' && location.protocol !== 'https:')
+        throw new Error('Serve fpile over http(s) (e.g. python -m http.server) to use cores/' + name + '.js');
+    const res = await fetch('./cores/' + name + '.js');
+    if (!res.ok) throw new Error('cores/' + name + '.js not found (HTTP ' + res.status + ')');
+    (0, eval)(await res.text());
+    const d = (self.fpileDrivers || {})[name];
+    if (!d || !d.install) throw new Error('cores/' + name + '.js did not register a driver (window.fpileDrivers["' + name + '"])');
+    coreDrivers.set(name, d);
+    return d;
 }
 
-/* Unpack a core jam (uploaded File or downloaded Blob) and install it into
-   the virtual host. Returns the coreId. Idempotent per coreId.              */
-async function installCoreJam(ext) {
-    let rec = customCores.get(ext) || null;
-    if (!rec) {
-        await probeHostedCore(ext);
-        if (!hostedCoreExts.has(ext)) throw new Error('core-' + ext + '.jam not found — include it in the uploaded folder or place it beside this page (cores/)');
-        const res = await fetch('./cores/core-' + ext + '.jam');
-        if (!res.ok) throw new Error('Failed to download core-' + ext + '.jam (HTTP ' + res.status + ')');
-        rec = { name: 'core-' + ext, file: await res.blob(), uploaded: false };
-        customCores.set(ext, rec);
-    }
-    if (rec.coreId) return rec.coreId;
+/* Kick off every known driver at page load (tiny meta files) so the
+   extension table is ready before the first upload scan. Non-fatal per file. */
+async function loadCoreDrivers() {
+    if (coreDrivers.size === DRIVER_FILES.length) return;
+    await Promise.all(DRIVER_FILES.map(n =>
+        ensureDriver(n).catch(e => console.warn('[fpile] cores/' + n + '.js: ' + (e && e.message || e)))));
+}
 
-    setStatus('Unpacking core-' + ext + '.jam…');
-    const buf = await rec.file.arrayBuffer();
-    const size = buf.byteLength;
-    const id = coreId(ext, size, await sha8Hex(buf));
-    rec.coreId = id;
-
-    const cache = await caches.open('jamcore-' + id);
-    if (await cache.match(coreUrl(id, 'index.html'))) return id;
-
-    // pick the entry the same way VFS does (shallowest index.html preferred)
-    const files = jamFiles(buf);
-    const htmls = [...files.keys()].filter(p => /\.html?$/i.test(p));
-    if (!htmls.length) throw new Error('No HTML entry inside core-' + ext + '.jam');
-    htmls.sort((a, b) => {
-        const aD = a.split('/').length, bD = b.split('/').length;
-        return aD !== bD ? aD - bD : a.length - b.length;
-    });
-    const entry = htmls.find(p => /(^|\/)index\.html?$/i.test(p)) || htmls[0];
-    const base = entry.includes('/') ? entry.slice(0, entry.lastIndexOf('/') + 1) : '';
-
-    const puts = [];
-    let total = 0;
-    for (const [path, data] of files) {
-        if (path.endsWith('/') || path.includes('__MACOSX') || path.endsWith('.DS_Store')) continue;
-        let rel = path.replace(/\\/g, '/').replace(/^\/+/, '');
-        if (base && rel.startsWith(base)) rel = rel.slice(base.length);
-        const headers = { 'Content-Type': mime(rel) };
-        total += data.length;
-        puts.push(cache.put(new Request(coreUrl(id, rel)), new Response(data, { headers })));
-    }
-    if (entry !== 'index.html') {
-        puts.push(cache.put(new Request(coreUrl(id, 'index.html')),
-            new Response(files.get(entry), { headers: { 'Content-Type': 'text/html' } })));
-    }
-    await ensureStorageSpace(null, total + 67108864); // persist + evict orphans if the budget is thin
-    try {
-        await Promise.all(puts);
-    } catch (err) {
-        // never leave a half-installed core behind: the cache is checked by
-        // index.html presence, so a partial unzip would pass as "installed"
-        try { await caches.delete('jamcore-' + id); } catch (e) {}
-        delete rec.coreId;
-        if (err && (err.name === 'QuotaExceededError' || /quota/i.test(String(err.message || err))))
-            throw new Error("storage full while unpacking core-" + ext + ".jam (" + (total / 1048576).toFixed(0) + " MB) — free disk space or clear this site's stored data, then retry");
-        throw err;
-    }
-    return id;
+/* Which loaded driver boots this ROM extension, if any. */
+function coreDriverForExt(ext) {
+    for (const d of coreDrivers.values())
+        if ((d.exts || []).includes(ext)) return d.name;
+    return null;
 }
 
 /* OPFS names must be filesystem-safe; keep them URL-round-trippable. */
@@ -586,21 +517,22 @@ async function ensureStorageSpace(opfsName, needBytes) {
     }
 }
 
-/* Launch a ROM through its custom core jam. */
-async function launchCoreJamRom(item) {
+/* Launch a ROM through its system core driver. */
+async function launchCoreDriverRom(item) {
     playerLayer.style.display = 'block';
     playerContent.innerHTML = '';
     try {
-        if (!('caches' in self)) throw new Error('Cache Storage unavailable — jam cores need http(s) + service worker support');
+        if (!('caches' in self)) throw new Error('Cache Storage unavailable — system cores need http(s) + service worker support');
         if (location.protocol !== 'http:' && location.protocol !== 'https:')
-            throw new Error('Serve fpile over http(s) (e.g. python -m http.server) to use jam cores');
+            throw new Error('Serve fpile over http(s) (e.g. python -m http.server) to use system cores');
 
         if (!self.crossOriginIsolated)
             console.warn('[fpile] not cross-origin isolated — the core will enable it itself or fail');
 
-        const ext = item.core;
-        setStatus('Booting core-' + ext + '.jam…');
-        const id = await installCoreJam(ext);
+        setStatus('Booting cores/' + item.core + '.js…');
+        const drv = await ensureDriver(item.core);
+        const id = drv.name;
+        await drv.install(driverCtx(drv));   // driver fetches its own files when stale
 
         const cache = await caches.open('jamcore-' + id);
         const romSrc = item.name + '.' + item.ext;
@@ -661,22 +593,16 @@ async function launchCoreJamRom(item) {
         setStatus('');
     } catch (err) {
         setStatus('Core error: ' + err.message);
-        console.error('[corejam]', err);
+        console.error('[core]', err);
     }
 }
 
-/* Drop jamcore caches that no longer match the uploaded/hosted cores. */
+/* Drop jamcore caches that do not belong to a loaded system driver. */
 async function sweepJamCores() {
     try {
-        const keep = new Set([...customCores.keys(), ...hostedCoreExts]);
+        const keep = new Set([...coreDrivers.keys()].map(n => 'jamcore-' + n));
         const names = await caches.keys();
-        await Promise.all(names.filter(n => {
-            if (!n.startsWith('jamcore-')) return false;
-            const seg = n.slice('jamcore-'.length).split('-'); // <ext…>-<size>-<sha8> (ext itself may hold dashes)
-            if (seg.length < 3) return true;                   // malformed
-            const ext = seg.slice(0, -2).join('-');
-            return !keep.has(ext);
-        }).map(n => caches.delete(n)));
+        await Promise.all(names.filter(n => n.startsWith('jamcore-') && !keep.has(n)).map(n => caches.delete(n)));
     } catch (e) {}
 }
 
@@ -907,7 +833,7 @@ function setStatus(msg) {
 async function processFiles(files) {
     imgMap.forEach(u => URL.revokeObjectURL(u)); imgMap.clear();
     blobCache.forEach(u => URL.revokeObjectURL(u)); blobCache.clear();
-    customCores.clear(); hostedCoreExts.clear();
+    if (!coreDrivers.size) await loadCoreDrivers();   // driver scripts register the ext table
 
     files.forEach(f => {
         const ln = f.name.toLowerCase();
@@ -917,23 +843,13 @@ async function processFiles(files) {
         }
     });
 
-    // Core jams, anywhere in the uploaded folder: core-<name>.jam
-    for (const f of files) {
-        if (f.name && CORE_JAM_RE.test(f.name)) {
-            const ext = f.name.match(CORE_JAM_RE)[1].toLowerCase();
-            if (!customCores.has(ext)) customCores.set(ext, { name: 'core-' + ext, file: f, uploaded: true });
-        }
-    }
-    rebuildCoreAlias();
-
     const classify = () => {
         const list = [], dropped = new Set();
         for (const f of files.filter(f => !f.name.startsWith('.') && f.size > 0)) {
             const ext = f.name.split('.').pop().toLowerCase();
             const name = f.name.substring(0, f.name.lastIndexOf('.')) || f.name;
-            if (CORE_JAM_RE.test(f.name)) continue;
             let type = 'emu', core = null;
-            const coreName = coreAlias.get(ext);
+            const coreName = coreDriverForExt(ext);   // a system driver claims this type
             if (coreName) { type = 'coreRom'; core = coreName; }
             else if (ext === 'swf') { type = 'flash'; core = 'flash'; }
             else if (ext === 'jam') { type = 'jam'; core = 'jam'; }
@@ -950,15 +866,7 @@ async function processFiles(files) {
 
     let res = classify();
     items = res.list;
-    if (res.dropped.size) {
-        sweepJamCores();
-        // unknown extensions might be handled by a core jam in ./cores/ — probe those
-        await Promise.all([...res.dropped].map(probeDroppedExt));
-        res = classify();
-        items = res.list;
-    } else {
-        sweepJamCores();
-    }
+    sweepJamCores();
 
     groups.clear();
     items.forEach(i => {
@@ -975,7 +883,7 @@ async function processFiles(files) {
         setStatus(items.length + ' files loaded' + skipNote);
     } else if (res.dropped.size) {
         setStatus('Skipped ' + res.dropped.size + ' file type(s): ' + [...res.dropped].map(e => '.' + e).join(' ') +
-            ' — upload core-<ext>.jam with the folder (or keep it in ./cores/)');
+            ' — no system core boots these (cores/<name>.js in the fpile folder)');
     }
 }
 
@@ -1027,7 +935,7 @@ function launch(item) {
     playerLayer.style.display = 'block';
     playerContent.innerHTML = '';
 
-    if (item.type === 'coreRom') { launchCoreJamRom(item); return; }
+    if (item.type === 'coreRom') { launchCoreDriverRom(item); return; }
     if (item.type === 'flash') {
         const url = URL.createObjectURL(item.file);
         frame(`<html><head><title>${item.name}</title><style>body,html{margin:0;padding:0;background:#000;overflow:hidden;width:100%;height:100%}</style></head><body>
@@ -1130,7 +1038,9 @@ document.getElementById('pack-up').addEventListener('change', async e => {
 });
 
 // Test/debug handles (not used by the UI)
-window.__fpile = { processFiles, launch, goHome, installCoreJam, probeHostedCore, rebuildCoreAlias, putRomInOPFS, ensureStorageSpace, sanitizeOpfsName, customCores, hostedCoreExts, coreUrl, coreAlias, get items(){ return items; }, get groups(){ return groups; } };
+window.__fpile = { processFiles, launch, goHome, ensureDriver, loadCoreDrivers, putRomInOPFS, ensureStorageSpace, sanitizeOpfsName, coreUrl, coreDrivers, get items(){ return items; }, get groups(){ return groups; } };
+
+loadCoreDrivers();
 });]]></script>
 <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
 <script>//<![CDATA[
