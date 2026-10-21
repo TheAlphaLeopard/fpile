@@ -476,18 +476,31 @@ async function installCoreJam(ext) {
     const base = entry.includes('/') ? entry.slice(0, entry.lastIndexOf('/') + 1) : '';
 
     const puts = [];
+    let total = 0;
     for (const [path, data] of files) {
         if (path.endsWith('/') || path.includes('__MACOSX') || path.endsWith('.DS_Store')) continue;
         let rel = path.replace(/\\/g, '/').replace(/^\/+/, '');
         if (base && rel.startsWith(base)) rel = rel.slice(base.length);
         const headers = { 'Content-Type': mime(rel) };
+        total += data.length;
         puts.push(cache.put(new Request(coreUrl(id, rel)), new Response(data, { headers })));
     }
     if (entry !== 'index.html') {
         puts.push(cache.put(new Request(coreUrl(id, 'index.html')),
             new Response(files.get(entry), { headers: { 'Content-Type': 'text/html' } })));
     }
-    await Promise.all(puts);
+    await ensureStorageSpace(null, total + 67108864); // persist + evict orphans if the budget is thin
+    try {
+        await Promise.all(puts);
+    } catch (err) {
+        // never leave a half-installed core behind: the cache is checked by
+        // index.html presence, so a partial unzip would pass as "installed"
+        try { await caches.delete('jamcore-' + id); } catch (e) {}
+        delete rec.coreId;
+        if (err && (err.name === 'QuotaExceededError' || /quota/i.test(String(err.message || err))))
+            throw new Error("storage full while unpacking core-" + ext + ".jam (" + (total / 1048576).toFixed(0) + " MB) — free disk space or clear this site's stored data, then retry");
+        throw err;
+    }
     return id;
 }
 
@@ -498,17 +511,79 @@ function sanitizeOpfsName(s) {
 
 /* Stream-clone a ROM into private OPFS storage (disk-backed, GBs allowed).
    Cache API entries carry a per-entry size cap, so big ROMs are stored here
-   and the SW streams them out on demand via a pointer entry.               */
+   and the SW streams them out on demand via a pointer entry.
+   OPFS writes run through a temp swap file, so writing over an existing
+   copy transiently needs TWICE its size — on tight storage that is the
+   classic repeating QuotaExceededError. The old copy (plus any partial
+   leftover from a failed write) is always removed first, and a failed
+   write cleans up after itself.                                           */
 async function putRomInOPFS(name, srcStream, expectedSize) {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle('fpile-roms', { create: true });
+    try { await dir.removeEntry(name); } catch (e) {}   // old copy / failed partial
     const fh = await dir.getFileHandle(name, { create: true });
     const w = await fh.createWritable();
-    await srcStream.pipeTo(w);
+    try {
+        await srcStream.pipeTo(w);
+    } catch (err) {
+        try { await w.close(); } catch (e) {}           // discards the swap file
+        try { await dir.removeEntry(name); } catch (e) {} // never keep partials
+        throw err;
+    }
     const stored = await (await dir.getFileHandle(name)).getFile();
     if (expectedSize != null && stored.size !== expectedSize)
         throw new Error('ROM storage mismatch (' + stored.size + ' bytes, expected ' + expectedSize + ')');
     return stored.size;
+}
+
+/* Make room for a big write when the origin's storage budget is thin.
+   Best-effort quota is brittle on small disks, so: ask Chrome to persist
+   the origin (raises the effective budget and stops opportunistic eviction),
+   then evict orphaned OPFS ROM copies that no jamcore pointer references
+   (a relaunch re-creates them by streaming the ROM file again — nothing
+   irreversible is lost). Advisory only: never throws, returns whether
+   the estimated headroom now covers needBytes.                            */
+async function ensureStorageSpace(opfsName, needBytes) {
+    try {
+        try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (e) {}
+        const est = await navigator.storage.estimate();
+        if (!est || !est.quota) return true;              // unknown budget — assume fine
+        const root = await navigator.storage.getDirectory();
+        let dir = null;
+        try { dir = await root.getDirectoryHandle('fpile-roms'); } catch (e) {}
+        let old = 0;                                      // copy being replaced is freed first
+        if (dir && opfsName) { try { old = (await (await dir.getFileHandle(opfsName)).getFile()).size; } catch (e) {} }
+        if ((est.quota - est.usage) + old >= needBytes) return true;
+        if (!dir) return (est.quota - est.usage) >= needBytes;
+        const reduce = String(opfsName || '').toLowerCase();
+        const refd = new Set();                           // OPFS files some pointer still uses
+        const cn = await caches.keys();
+        await Promise.all(cn.filter(n => n.startsWith('jamcore-')).map(async k => {
+            const c = await caches.open(k);
+            try {
+                const ks = await c.keys();
+                for (const key of ks) {
+                    if (!key.url.includes('/__rom__/')) continue;
+                    const r = await c.match(key);
+                    if (!r) continue;
+                    try { const meta = await r.json(); if (meta && meta.opfs) refd.add(String(meta.opfs).split('/').pop().toLowerCase()); } catch (e) {}
+                }
+            } catch (e) {}
+        }));
+        let freed = 0;
+        try {
+            for await (const nm of dir.keys()) {
+                const lk = String(nm).toLowerCase();
+                if (refd.has(lk) || lk === reduce) continue;
+                try { freed += (await (await dir.getFileHandle(nm)).getFile()).size; await dir.removeEntry(nm); } catch (e) {}
+            }
+        } catch (e) {}                                    // iterator unavailable — skip GC
+        if (freed) console.log('[fpile] storage thin — freed ' + (freed / 1048576).toFixed(0) + ' MB of unreferenced ROM leftovers');
+        const est2 = await navigator.storage.estimate();
+        return (est2.quota - est2.usage) + old >= needBytes;
+    } catch (e) {
+        return true;                                      // never block a launch on preflight trouble
+    }
 }
 
 /* Launch a ROM through its custom core jam. */
@@ -555,7 +630,14 @@ async function launchCoreJamRom(item) {
         if (needsPut) {
             setStatus('Installing ' + romSrc + ' (' + (item.file.size / 1048576).toFixed(0) + ' MB)…');
             const opfsName = sanitizeOpfsName(romSrc);
-            await putRomInOPFS(opfsName, item.file.stream(), item.file.size);
+            await ensureStorageSpace(opfsName, item.file.size); // persist + evict orphans if the budget is thin
+            try {
+                await putRomInOPFS(opfsName, item.file.stream(), item.file.size);
+            } catch (err) {
+                if (err && (err.name === 'QuotaExceededError' || /quota/i.test(String(err.message || err))))
+                    throw new Error('storage full: need ' + (item.file.size / 1073741824).toFixed(1) + ' GB for ' + romSrc + " — free disk space or clear this site's stored data, then retry");
+                throw err;
+            }
             await cache.put(new Request(romAbs),
                 new Response(JSON.stringify({ opfs: 'fpile-roms/' + opfsName, size: item.file.size }),
                     { headers: { 'Content-Type': 'application/json' } }));
@@ -752,7 +834,9 @@ const CORE_MAP = {
     nds:["nds","ids"],
     // Sony
     psx:["ps1","psx","pbp","m3u","toc","cue"],
-    psp:["iso","cso","pbp","prx"],
+    // PSP formats (iso/cso/pbp/prx/psp/chd) are jam-core formats: they belong
+    // to core-<name>.jam (alias claims them). A builtin entry here would send
+    // them to EmulatorJS, which has no PSP core. Matches fpile.html.
     ps2:["iso","bin","img","mdf","nrg","gz","chd"],
     // Nintendo disc
     gc:["gcm","iso","gcz","tgc"],
@@ -1046,7 +1130,7 @@ document.getElementById('pack-up').addEventListener('change', async e => {
 });
 
 // Test/debug handles (not used by the UI)
-window.__fpile = { processFiles, launch, goHome, installCoreJam, probeHostedCore, rebuildCoreAlias, putRomInOPFS, sanitizeOpfsName, customCores, hostedCoreExts, coreUrl, coreAlias, get items(){ return items; }, get groups(){ return groups; } };
+window.__fpile = { processFiles, launch, goHome, installCoreJam, probeHostedCore, rebuildCoreAlias, putRomInOPFS, ensureStorageSpace, sanitizeOpfsName, customCores, hostedCoreExts, coreUrl, coreAlias, get items(){ return items; }, get groups(){ return groups; } };
 });]]></script>
 <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
 <script>//<![CDATA[
