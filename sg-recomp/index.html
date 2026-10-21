@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>ppsspp web · psp emulator</title>
+  <meta name="description" content="browser-native psp emulator — bring your own roms from any url or file.">
+  <meta name="theme-color" content="#0c0b0a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Special+Elite&display=swap" rel="stylesheet">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/ppsspp-logo-192.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+  <!-- game canvas (owned by ppsspp) -->
+  <div id="stage">
+    <canvas id="canvas" tabindex="-1"></canvas>
+    <div id="stagebadge" hidden></div>
+  </div>
+
+  <!-- boot page: logo · loading bar · console. nothing else. -->
+  <div id="boot">
+    <div class="boot-inner">
+      <img class="boot-logo" src="assets/ppsspp-logo-512.png" alt="">
+      <div class="bootload">
+        <div id="bootbar"><div id="bootbar-fill"></div></div>
+        <div id="bootstatus"></div>
+      </div>
+      <div id="bootConsole" aria-live="polite"></div>
+      <div id="booterror" hidden></div>
+    </div>
+  </div>
+
+  <!-- side panel -->
+  <div id="backdrop"></div>
+  <aside id="panel" aria-hidden="true">
+    <header class="panel-head">
+      <button class="tab active" data-tab="library">library</button>
+      <button class="tab" data-tab="saves">saves</button>
+      <button class="tab" data-tab="info">info</button>
+      <button class="tab" data-tab="log">log</button>
+      <button id="panelclose" title="close">✕</button>
+    </header>
+    <div class="panel-body">
+      <section class="tab-panel active" id="tabLibrary">
+        <div class="panel-note">games you add are stored in this browser (opfs) and mounted at /games.</div>
+        <div class="row-actions">
+          <button class="btn" id="libraryAddBtn">add game file…</button>
+          <input type="file" id="gameFile" accept=".iso,.cso,.chd,.pbp,.elf,.prx" hidden>
+        </div>
+        <div id="libraryGrid"></div>
+        <div class="storage-line" id="storageLine"></div>
+      </section>
+
+      <section class="tab-panel" id="tabSaves">
+        <div id="saveStats"></div>
+        <div class="row-actions">
+          <button class="btn" id="syncSavesBtn">sync now</button>
+          <button class="btn" id="exportSavesBtn">export all…</button>
+          <button class="btn" id="importSavesBtn">import…</button>
+          <input type="file" id="importSavesFile" accept=".ppsspp,.json" hidden>
+        </div>
+        <div id="savesList"></div>
+      </section>
+
+      <section class="tab-panel" id="tabInfo">
+        <div class="info-grid" id="infoGrid"></div>
+        <div class="panel-note">keyboard — ppsspp defaults (remap in-game: settings ▸ controls ▸ keyboard)</div>
+        <div id="controls-table-panel"></div>
+        <div class="row-actions diagnostics">
+          <button class="btn" id="diagnosticsBtn">export diagnostics</button>
+          <button class="btn danger" id="resetSettingsBtn">reset emulator settings</button>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tabLog">
+        <div><input id="logFilter" type="text" placeholder="filter…" autocomplete="off"></div>
+        <div id="logView" aria-live="polite"></div>
+      </section>
+    </div>
+  </aside>
+
+  <!-- confirm -->
+  <div id="confirmmodal" aria-hidden="true">
+    <div class="modal-card">
+      <p id="confirmText" class="modal-text"></p>
+      <div class="modal-actions">
+        <button class="btn" id="confirmYes">confirm</button>
+        <button class="btn subtle" id="confirmNo">cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- footer overlay: appears when pointer enters bottom 3% -->
+  <div id="footzone"></div>
+  <footer id="footer" aria-label="player controls">
+    <button class="f-btn" id="footPlay" title="library">▶ library</button>
+    <button class="f-btn" id="footLoad" title="add a game file">＋ load</button>
+    <button class="f-btn" id="footSaves" title="saves">≡ saves</button>
+    <button class="f-btn" id="footInfo" title="system info">℗ info</button>
+    <span class="f-space"></span>
+    <button class="f-btn" id="footFull" title="fullscreen">⛶ full</button>
+    <button class="f-btn danger" id="footExit" title="exit to ppsspp home menu">⏻ exit</button>
+    <span id="fpsline">fps <b>—</b></span>
+  </footer>
+
+  <div class="toast" id="toast"></div>
+  <noscript><p style="padding:20px">this emulator needs javascript + webassembly.</p></noscript>
+
+  <script src="app.js"></script>
+</body>
+</html>

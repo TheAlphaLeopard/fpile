@@ -1,0 +1,25 @@
+{
+  "name": "ppsspp web · psp emulator",
+  "short_name": "ppsspp web",
+  "description": "browser-native psp emulator — bring your own roms from any url or file.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#0c0b0a",
+  "theme_color": "#0c0b0a",
+  "icons": [
+    {
+      "src": "assets/ppsspp-logo-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/ppsspp-logo-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

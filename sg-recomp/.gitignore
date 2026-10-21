@@ -1,0 +1,17 @@
+# Tool or OS clutter
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# Local media you keep beside the tool — never pushed to git
+*.iso
+*.cso
+*.chd
+*.pbp
+*.zso
+*.zip
+
+# Local scratch / tooling experiments
+_external/
+*.tmp

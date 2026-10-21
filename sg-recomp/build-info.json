@@ -1,0 +1,19 @@
+{
+  "source": "root-hunter.github.io/ppsspp-web (GH Pages artifact)",
+  "core_repository": "root-hunter/ppsspp-wasm@wasm",
+  "revision_sha256": "d0cdf243d5f04b2c6e2e1675ecb92513c79f1a2cd2671d95eb8da61676962b34",
+  "files": {
+    "PPSSPPSDL.js": {
+      "sha256": "384426f17aed67430f9d691195627449aee195952d3937eae88b7e6c968b13da",
+      "bytes": 357702
+    },
+    "PPSSPPSDL.wasm": {
+      "sha256": "c30876d3e59b86162ef3a1eadcce0355ada8f7ee1e759928e2648165ccc077b3",
+      "bytes": 17591985
+    },
+    "PPSSPPSDL.data": {
+      "sha256": "87076b1c68519a2bf03e347f8a16222521f06beca9f3fc74d8743f968eb2c5da",
+      "bytes": 22417335
+    }
+  }
+}
